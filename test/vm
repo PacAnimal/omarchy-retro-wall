@@ -1,0 +1,194 @@
+#!/bin/bash
+# A throwaway Omarchy machine to test the plugin in, under QEMU and KVM, on the host's loopback only.
+#
+#   test/vm base [ISO]     install Omarchy from its ISO, unattended, into a base image (once; kept)
+#   test/vm up             boot a copy-on-write copy of the base image; the base is never written
+#   test/vm ssh [CMD...]   a shell, or CMD, in the machine as its user
+#   test/vm session CMD... CMD in the machine's Hyprland session (its WAYLAND_DISPLAY and signature)
+#   test/vm shot FILE      the machine's screen, every monitor, to FILE (a PNG, through grim)
+#   test/vm down           power it off and delete the copy
+#
+# The ISO is checked against its signature by the key Omarchy names in its own repository. The machine
+# has a virtio GPU (Mesa renders in software), 8 GB and 4 processors, and QEMU's user networking, with
+# its ssh forwarded to 127.0.0.1:$OMARCHY_VM_PORT (2322). Its user is "tester", password "tester".
+# OMARCHY_VM_HEADS=2 gives it two monitors.
+# Everything is kept in ${XDG_CACHE_HOME:-~/.cache}/omarchy-retro-wall-vm.
+#
+# Needs qemu-system-x86_64, qemu-img, OVMF, xorriso, openssl, jq, gpg and ssh.
+set -euo pipefail
+
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-retro-wall-vm
+port=${OMARCHY_VM_PORT:-2322}
+key_fpr=40DFB630FF42BCFFB047046CF0134EE680CAC571
+user=tester
+ovmf_code=/usr/share/OVMF/OVMF_CODE_4M.fd
+ovmf_vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+disk_gb=40
+
+say() { printf 'vm: %s\n' "$*" >&2; }
+die() { say "$*"; exit 2; }
+
+mkdir -p "$cache"
+[[ -f $cache/id ]] || ssh-keygen -q -t ed25519 -N '' -C omarchy-vm -f "$cache/id"
+sshopts=(-i "$cache/id" -p "$port" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+	-o LogLevel=ERROR -o ConnectTimeout=5)
+
+qemu() {   # DISK VARS SERIAL [ARGS...]
+	local disk=$1 vars=$2 serial=$3; shift 3
+	qemu-system-x86_64 -enable-kvm -machine q35,accel=kvm -cpu host -smp 4 -m 8192 \
+		-drive if=pflash,format=raw,readonly=on,file="$ovmf_code" -drive if=pflash,format=raw,file="$vars" \
+		-drive file="$disk",format=qcow2,if=none,id=d0 -device virtio-blk-pci,drive=d0,bootindex=1 \
+		-device virtio-vga,max_outputs="${OMARCHY_VM_HEADS:-1}" -display none -usb -device usb-tablet \
+		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=n0 \
+		-qmp "unix:$cache/qmp.sock,server,nowait" -serial "file:$serial" -pidfile "$cache/qemu.pid" -daemonize "$@"
+}
+
+running() { [[ -f $cache/qemu.pid ]] && kill -0 "$(cat "$cache/qemu.pid")" 2>/dev/null; }
+
+wait_ssh() {   # SECONDS
+	local i
+	for ((i = 0; i < $1; i += 5)); do
+		ssh "${sshopts[@]}" "$user@127.0.0.1" true 2>/dev/null && return 0
+		running || return 1
+		sleep 5
+	done
+	return 1
+}
+
+base() {
+	local iso=${1:-$cache/omarchy.iso} work hash
+	[[ ! -f $cache/base.qcow2 ]] || { say "the base image is there: $cache/base.qcow2"; return 0; }
+	[[ -f $iso && -f $iso.sig ]] || die "no ISO: give its path, with ISO.sig beside it"
+	GNUPGHOME=$(mktemp -d); export GNUPGHOME
+	gpg -q --keyserver hkps://keys.openpgp.org --recv-keys "$key_fpr" 2>/dev/null ||
+		gpg -q --keyserver hkps://keyserver.ubuntu.com --recv-keys "$key_fpr" || die "could not fetch Omarchy's key"
+	gpg -q --verify "$iso.sig" "$iso" 2>/dev/null || die "$iso: its signature does not verify"
+	rm -rf "$GNUPGHOME"; unset GNUPGHOME
+	say "$iso: signed by Omarchy"
+
+	work=$(mktemp -d); trap 'rm -rf "$work"' RETURN
+	mkdir "$work/cidata"
+	hash=$(openssl passwd -6 "$user")
+	jq -n --arg h "$hash" --arg u "$user" \
+		'{root_enc_password: $h, users: [{enc_password: $h, groups: [], sudo: true, username: $u}]}' >"$work/cidata/user_credentials.json"
+	local mib=$((1024 * 1024)) gib=$((1024 * 1024 * 1024)) bytes=$((disk_gb * 1024 * 1024 * 1024))
+	local bs=$mib bsz=$((2 * gib)); local ms=$((bs + bsz)); local msz=$((bytes - ms - mib))
+	sed -e "s/@BS@/$bs/; s/@BSZ@/$bsz/; s/@MS@/$ms/; s/@MSZ@/$msz/" >"$work/cidata/user_configuration.json" <<'EOF'
+{
+  "app_config": null, "archinstall-language": "English", "auth_config": {},
+  "audio_config": { "audio": "pipewire" },
+  "bootloader_config": { "bootloader": "Limine", "uki": true, "removable": false },
+  "custom_commands": [],
+  "omarchy_install": {
+    "mode": "full_disk", "defer_provisioning": false, "target_mount": "/mnt",
+    "boot": { "esp_mount": "/boot", "esp_path": "/EFI/limine", "efi_binary": "limine_x64.efi", "enable_fallback": true },
+    "storage": { "kernel": "linux-omarchy" }
+  },
+  "disk_config": {
+    "config_type": "default_layout",
+    "device_modifications": [ { "device": "/dev/vda", "wipe": true, "partitions": [
+      { "btrfs": [], "dev_path": null, "flags": ["boot", "esp"], "fs_type": "fat32", "mount_options": [], "mountpoint": "/boot",
+        "obj_id": "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d",
+        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": @BSZ@ },
+        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": @BS@ },
+        "status": "create", "type": "primary" },
+      { "btrfs": [ { "mountpoint": "/", "name": "@" }, { "mountpoint": "/home", "name": "@home" },
+                   { "mountpoint": "/var/log", "name": "@log" }, { "mountpoint": "/var/cache/pacman/pkg", "name": "@pkg" } ],
+        "dev_path": null, "flags": [], "fs_type": "btrfs", "mount_options": ["compress=zstd"], "mountpoint": null,
+        "obj_id": "8c2c2b92-1070-455d-b76a-56263bab24aa",
+        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": @MSZ@ },
+        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": @MS@ },
+        "status": "create", "type": "primary" } ] } ]
+  },
+  "hostname": "omarchy", "kernels": ["linux-omarchy"], "network_config": { "type": "iso" }, "ntp": true,
+  "parallel_downloads": 8, "script": null, "services": [], "swap": true, "timezone": "UTC",
+  "locale_config": { "kb_layout": "us", "sys_enc": "UTF-8", "sys_lang": "en_US.UTF-8" },
+  "mirror_config": { "custom_repositories": [], "custom_servers": [
+      { "url": "https://mirror.omarchy.org/$repo/os/$arch" }, { "url": "https://geo.mirror.pkgbuild.com/$repo/os/$arch" } ],
+    "mirror_regions": {}, "optional_repositories": [] },
+  "packages": ["base-devel", "git", "omarchy-keyring", "omarchy-settings", "omarchy"],
+  "profile_config": { "gfx_driver": null, "greeter": null, "profile": {} },
+  "version": "3.0.9"
+}
+EOF
+	echo false >"$work/cidata/user_encrypt_installation.txt"
+	cp "$cache/id.pub" "$work/cidata/authorized_keys"
+	xorriso -as mkisofs -quiet -o "$work/cidata.iso" -V cidata -J -r "$work/cidata" 2>/dev/null || die "could not make the cidata disk"
+
+	qemu-img create -q -f qcow2 "$cache/base.part.qcow2" "${disk_gb}G"
+	cp "$ovmf_vars" "$cache/base.vars.fd"
+	say "installing Omarchy (unattended): the console is in $cache/install.serial"
+	qemu "$cache/base.part.qcow2" "$cache/base.vars.fd" "$cache/install.serial" \
+		-drive file="$iso",media=cdrom,readonly=on,if=none,id=cd0 -device ide-cd,drive=cd0,bus=ide.0,bootindex=2 \
+		-drive file="$work/cidata.iso",media=cdrom,readonly=on,if=none,id=cd1 -device ide-cd,drive=cd1,bus=ide.1
+	# the install reboots into the system it installed: its user answering ssh is the end of it
+	wait_ssh "${OMARCHY_VM_INSTALL_TIMEOUT:-3600}" || { tail -n 40 "$cache/install.serial" >&2; die "the install did not finish"; }
+	say "installed"
+	vm_sudo 'poweroff' || :
+	stopped
+	mv "$cache/base.part.qcow2" "$cache/base.qcow2"
+	settle_base
+	say "base image: $cache/base.qcow2"
+}
+
+# Root's commands in the machine, through the user's sudo
+# shellcheck disable=SC2029  # the command is made here on purpose, quoted for the machine's shell
+vm_sudo() { ssh "${sshopts[@]}" "$user@127.0.0.1" "echo $user | sudo -S -p '' bash -c $(printf '%q' "$1")"; }
+
+stopped() {
+	local i; for ((i = 0; i < 120; i++)); do running || return 0; sleep 1; done
+	kill "$(cat "$cache/qemu.pid")"
+}
+
+# A session waiting at every boot, as at a desk: SDDM logs the user in to Omarchy's Hyprland (a test
+# machine's own setting, in a file of its own), and the first login's provisioning runs to its end, once,
+# in the base image.
+settle_base() {
+	say "settling the base image: autologin, and the first login's provisioning"
+	qemu "$cache/base.qcow2" "$cache/base.vars.fd" "$cache/settle.serial"
+	wait_ssh 600 || die "it did not answer ssh: $cache/settle.serial"
+	vm_sudo 'printf "[Autologin]\nUser=tester\nSession=hyprland-uwsm\nRelogin=true\n" >/etc/sddm.conf.d/90-test-autologin.conf && systemctl restart sddm'
+	ssh "${sshopts[@]}" "$user@127.0.0.1" 'for i in $(seq 180); do omarchy-done check first-run-user 2>/dev/null && pgrep -x quickshell >/dev/null && exit 0; sleep 5; done; exit 1' ||
+		die "the first login did not finish its provisioning"
+	ssh "${sshopts[@]}" "$user@127.0.0.1" 'sleep 20; sync'
+	vm_sudo 'poweroff' || :
+	stopped
+	say "base image: $cache/base.qcow2"
+}
+
+up() {
+	[[ -f $cache/base.qcow2 ]] || die "no base image: test/vm base ISO first"
+	running && die "it is already up"
+	qemu-img create -q -f qcow2 -b "$cache/base.qcow2" -F qcow2 "$cache/run.qcow2"
+	cp "$cache/base.vars.fd" "$cache/run.vars.fd"
+	qemu "$cache/run.qcow2" "$cache/run.vars.fd" "$cache/run.serial"
+	wait_ssh 600 || die "it did not answer ssh: $cache/run.serial"
+	say "up: ssh ${sshopts[*]} $user@127.0.0.1"
+}
+
+down() {
+	if running; then
+		ssh "${sshopts[@]}" "$user@127.0.0.1" 'echo tester | sudo -S -p "" poweroff' 2>/dev/null || :
+		local i; for ((i = 0; i < 60; i++)); do running || break; sleep 1; done
+		running && kill "$(cat "$cache/qemu.pid")"
+	fi
+	rm -f "$cache/run.qcow2" "$cache/run.vars.fd" "$cache/qemu.pid"
+}
+
+# The session's environment, read from the shell Hyprland started (Hyprland's own lacks its signature)
+# shellcheck disable=SC2016
+session_env='pid=$(pgrep -u "$(id -u)" -x quickshell | head -n1); [[ -n $pid ]] || { echo "no Omarchy session" >&2; exit 3; }
+while IFS= read -r -d "" kv; do case $kv in WAYLAND_DISPLAY=*|HYPRLAND_INSTANCE_SIGNATURE=*|XDG_RUNTIME_DIR=*|OMARCHY_PATH=*|PATH=*|DBUS_SESSION_BUS_ADDRESS=*) export "${kv?}";; esac; done </proc/$pid/environ
+[[ -n ${WAYLAND_DISPLAY:-} ]] || export WAYLAND_DISPLAY=wayland-1'
+
+# shellcheck disable=SC2029  # $session_env and the commands given are meant for the machine's shell
+case ${1:-} in
+	base) shift; base "$@" ;;
+	settle) settle_base ;;
+	up) up ;;
+	down) down ;;
+	ssh) shift; exec ssh "${sshopts[@]}" "$user@127.0.0.1" "$@" ;;
+	session) shift; exec ssh "${sshopts[@]}" "$user@127.0.0.1" "$session_env; $*" ;;
+	shot) ssh "${sshopts[@]}" "$user@127.0.0.1" "$session_env; grim -t png -" >"$2" ;;
+	*) sed -n '4,9p' "$0" | sed 's/^# *//' >&2; exit 2 ;;
+esac

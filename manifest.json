@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.pacanimal.retro-wall",
+  "name": "retro-wall",
+  "version": "1.0.0",
+  "author": "PacAnimal",
+  "description": "retro-wall's live scenes as backgrounds: pick one in the background picker and it moves, with the machine's readings in it",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

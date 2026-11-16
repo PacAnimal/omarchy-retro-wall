@@ -1,0 +1,136 @@
+#!/bin/bash
+# The plugin's file work, run by Service.qml. It touches nothing outside these paths:
+#
+#   ~/.local/share/retro/omarchy/              the stills, one per retro-wall theme: retro-wall-NAME.png
+#   ~/.config/omarchy/backgrounds/THEME/       a link to each still, so the background picker lists it
+#
+#   retro-wall-omarchy sync THEME WIDTHxHEIGHT [--reserve-EDGE PX]...
+#       the stills drawn (again, when retro-wall, the size or the reserve changed), and their links in
+#       Omarchy theme THEME's backgrounds; links to themes retro-wall no longer has are removed
+#   retro-wall-omarchy clean
+#       every link this made, in every Omarchy theme's backgrounds, removed; the stills too
+#   retro-wall-omarchy run THEME [ARG...]
+#       retro-wall playing THEME on every monitor, with this display's options from
+#       ~/.config/retro/retro-wall.conf first (as it reads them when started with none), then ARGs; it ends
+#       with the process that started it; what it says goes to ~/.local/share/retro/retro-wall.log
+#
+# The themes listed are all of retro-wall's, or those named in ~/.config/retro/omarchy-themes (one name a
+# line, # for a comment).
+set -euo pipefail
+
+share=$HOME/.local/share/retro
+binary=$share/retro-wall
+stills=$share/omarchy
+backgrounds=$HOME/.config/omarchy/backgrounds
+chosen=$HOME/.config/retro/omarchy-themes
+
+say() { printf '%s\n' "$*"; }
+
+# every link in a backgrounds directory that points at a still of ours
+ours() {
+	[[ -d $backgrounds ]] || return 0
+	find "$backgrounds" -mindepth 2 -maxdepth 2 -type l -lname "$stills/*" -print
+}
+
+themes() {
+	local all name
+	all=$("$binary" --list 2>/dev/null | sed -n 's/^  [^:]*: //p' | tr ',' '\n' | tr -d ' ' | sort -u)
+	if [[ -f $chosen ]]; then
+		while read -r name; do
+			name=${name%%#*}; name=${name//[[:space:]]/}
+			[[ -n $name ]] && grep -qxF "$name" <<<"$all" && echo "$name"
+		done <"$chosen"
+	else
+		printf '%s\n' "$all"
+	fi
+}
+
+sync() {
+	local theme=$1 size=$2; shift 2
+	local w=${size%x*} h=${size#*x} name stamp file dir
+	[[ -x $binary ]] || { say "missing $binary"; exit 3; }
+	[[ $theme =~ ^[a-z0-9_][a-z0-9._+-]*$ ]] || { say "not a theme name: $theme"; exit 2; }
+	if ! [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] || ((w == 0 || h == 0)); then say "not a size: $size"; exit 2; fi
+	mkdir -p "$stills"
+	# what the stills were drawn by and for: a change draws them again
+	stamp="$("$binary" --version 2>/dev/null) $(stat -Lc %Y "$binary") ${w}x$h $*"
+	if [[ $(cat "$stills/.drawn" 2>/dev/null) != "$stamp" ]]; then
+		rm -f "$stills"/retro-wall-*.png "$stills/.drawn"
+	fi
+	mapfile -t wanted < <(themes)
+	for name in "${wanted[@]}"; do
+		file=$stills/retro-wall-$name.png
+		[[ -s $file ]] && continue
+		if "$binary" --preview "$file.new" "${w}x$h" --theme "$name" "$@" >/dev/null 2>&1; then
+			mv "$file.new" "$file"
+		else
+			rm -f "$file.new"; say "could not draw $name"
+		fi
+	done
+	printf '%s\n' "$stamp" >"$stills/.drawn"
+	# the links: those of themes no longer wanted, or broken, go; the wanted ones are made in THEME
+	while IFS= read -r link; do
+		name=$(basename "$link" .png); name=${name#retro-wall-}
+		if [[ ! -e $link ]] || ! printf '%s\n' "${wanted[@]}" | grep -qxF "$name"; then rm -f "$link"; fi
+	done < <(ours)
+	dir=$backgrounds/$theme
+	for name in "${wanted[@]}"; do
+		file=$stills/retro-wall-$name.png
+		[[ -s $file ]] || continue
+		[[ -e $dir/retro-wall-$name.png || -L $dir/retro-wall-$name.png ]] && continue
+		mkdir -p "$dir"
+		ln -s "$file" "$dir/retro-wall-$name.png"
+	done
+	say "synced ${#wanted[@]} into $dir"
+}
+
+# The words of this display's line in retro-wall.conf, one a line: its Wayland socket's line, else its X
+# display's, as retro-wall finds it (a word with a space in double quotes; # starts a comment)
+conf_words() {
+	local conf=${XDG_CONFIG_HOME:-$HOME/.config}/retro/retro-wall.conf line key d words word quoted any c i
+	[[ -f $conf ]] || return 0
+	local wanted=()
+	[[ -z ${WAYLAND_DISPLAY:-} ]] || wanted+=("$WAYLAND_DISPLAY")
+	if [[ -n ${DISPLAY:-} ]]; then d=${DISPLAY#*:}; [[ $d == *.* ]] || d=$d.0; wanted+=("${DISPLAY%%:*}:$d"); fi
+	for key in ${wanted[@]+"${wanted[@]}"}; do
+		while IFS= read -r line || [[ -n $line ]]; do
+			words=() word="" quoted=0 any=0
+			for ((i = 0; i < ${#line}; i++)); do
+				c=${line:i:1}
+				if [[ $c == '"' ]]; then quoted=$((1 - quoted)); any=1
+				elif [[ $c == '#' && $quoted == 0 ]]; then break
+				elif [[ $c =~ [[:space:]] && $quoted == 0 ]]; then
+					if ((any)); then words+=("$word"); word="" any=0; fi
+				else word+=$c; any=1
+				fi
+			done
+			((any)) && words+=("$word")
+			((${#words[@]})) || continue
+			d=${words[0]}
+			if [[ $d == *:* || $d =~ ^[0-9]+$ ]]; then [[ $d == *:* ]] || d=:$d; [[ ${d#*:} == *.* ]] || d=$d.0; fi
+			if [[ $d == "$key" ]]; then printf '%s\n' "${words[@]:1}"; return 0; fi
+		done <"$conf"
+	done
+}
+
+run() {
+	local theme=$1; shift
+	[[ -x $binary ]] || { say "missing $binary"; exit 3; }
+	local conf=()
+	mapfile -t conf < <(conf_words)
+	exec >"$share/retro-wall.log" 2>&1   # what it says, for this run, where linux/uninstall removes it
+	exec setpriv --pdeathsig TERM -- "$binary" ${conf[@]+"${conf[@]}"} --theme "$theme" --all-monitors "$@"
+}
+
+clean() {
+	ours | while IFS= read -r link; do rm -f "$link"; done
+	rm -rf "$stills"
+	say "cleaned"
+}
+
+case ${1:-} in
+	sync) shift; (($# >= 2)) || exit 2; sync "$@" ;;
+	clean) clean ;;
+	run) shift; (($# >= 1)) || exit 2; run "$@" ;;
+	*) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac
