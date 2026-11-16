@@ -182,9 +182,19 @@ Item {
     if (root.scene !== root.wallScene && !wall.running) root.wallFailures = 0
     var want = root.installed && root.scene !== "" && root.wallFailures < 5
     if (want && wall.running && root.wallScene === root.scene) return
-    if (wall.running) wall.running = false   // onExited starts it again with what is wanted now
-    else if (want) start()
-    if (!want && root.suspended && !root.isVideo(root.background)) root.setSuspended(false)
+    var video = root.isVideo(root.background)
+    if (wall.running && root.suspended && !video) {
+      // another scene, or a still: the shell shows its still first, then the scene ends, so nothing
+      // empty is seen between them (onExited starts what is wanted then)
+      root.setSuspended(false)
+      handover.restart()
+    } else if (wall.running) {
+      if (!handover.running) wall.running = false
+    } else if (want) {
+      start()
+    } else if (root.suspended && !video) {
+      root.setSuspended(false)
+    }
   }
 
   function start() {
@@ -232,6 +242,9 @@ Item {
       }
     }
   }
+  // The shell's background is shown again before the playing scene ends.
+  Timer { id: handover; interval: 400; onTriggered: wall.running = false }
+
   // Read again first: the program could be gone, or the background changed meanwhile.
   Timer { id: restartWall; onTriggered: root.read() }
 
