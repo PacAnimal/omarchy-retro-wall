@@ -11,7 +11,7 @@
 # The ISO is checked against its signature by the key Omarchy names in its own repository. The machine
 # has a virtio GPU (Mesa renders in software), 8 GB and 4 processors, and QEMU's user networking, with
 # its ssh forwarded to 127.0.0.1:$OMARCHY_VM_PORT (2322). Its user is "tester", password "tester".
-# OMARCHY_VM_HEADS=2 gives it two monitors.
+# OMARCHY_VM_HEADS=2 gives it two monitors; OMARCHY_VM_CPUS more processors (Mesa renders on them).
 # Everything is kept in ${XDG_CACHE_HOME:-~/.cache}/omarchy-retro-wall-vm.
 #
 # Needs qemu-system-x86_64, qemu-img, OVMF, xorriso, openssl, jq, gpg and ssh.
@@ -35,7 +35,7 @@ sshopts=(-i "$cache/id" -p "$port" -o IdentitiesOnly=yes -o StrictHostKeyCheckin
 
 qemu() {   # DISK VARS SERIAL [ARGS...]
 	local disk=$1 vars=$2 serial=$3; shift 3
-	qemu-system-x86_64 -enable-kvm -machine q35,accel=kvm -cpu host -smp 4 -m 8192 \
+	qemu-system-x86_64 -enable-kvm -machine q35,accel=kvm -cpu host -smp "${OMARCHY_VM_CPUS:-4}" -m 8192 \
 		-drive if=pflash,format=raw,readonly=on,file="$ovmf_code" -drive if=pflash,format=raw,file="$vars" \
 		-drive file="$disk",format=qcow2,if=none,id=d0 -device virtio-blk-pci,drive=d0,bootindex=1 \
 		-device virtio-vga,max_outputs="${OMARCHY_VM_HEADS:-1}" -display none -usb -device usb-tablet \
