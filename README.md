@@ -1,11 +1,14 @@
 # retro-wall for Omarchy
 
 [retro-wall](https://github.com/PacAnimal/retro-wall)'s live scenes as Omarchy backgrounds: a
-synthwave horizon, a rainy neon city, the digital rain, a winter field and more, which move, with the
+synthwave horizon, a rainy neon city, falling green glyphs, a winter field and more, which move, with the
 machine's readings in them. Pick one in the background picker (`Super + Ctrl + W`) and it plays; pick
 any other background and it stops.
 
-![the background picker over a playing scene](preview.png)
+![the scenes in turn, each chosen in the background picker](omarchy.gif)
+
+<sub>The scenes chosen in turn in Omarchy's background picker (`Super + Ctrl + W`), and back to the
+theme's own background. Recorded in a virtual machine with made-up readings.</sub>
 
 ## How it fits in
 
