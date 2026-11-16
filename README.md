@@ -23,6 +23,9 @@ any other background and it stops.
 - **It costs nothing when unseen.** retro-wall pauses while the session is locked, the screensaver
   runs, or every monitor shows a fullscreen window, and it stops drawing on battery. When anything
   but a scene is the background, it is not running at all.
+- **Known:** while a scene plays, double-clicking the bare desktop does not open the picker, as with a
+  video background in Omarchy 4.5: the shell's click layer is not there while its background is
+  suspended. `Super + Ctrl + W` opens it.
 - **Nothing of Omarchy's is changed.** It uses Omarchy's own contracts only: the background link, the
   backgrounds folder, `omarchy-shell background setSuspended`, and the plugin interface.
 
